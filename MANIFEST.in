@@ -1,0 +1,12 @@
+include CMakeLists.txt
+include README.md
+include LICENSE
+recursive-include include *
+recursive-include src *
+recursive-include tests *
+
+global-exclude *.o
+global-exclude *.so
+global-exclude *.dylib
+global-exclude *.a
+

@@ -94,6 +94,9 @@ if(BUILD_PYTHON)
     set_target_properties(microvm_module PROPERTIES 
         PREFIX ""
         OUTPUT_NAME "microvm"
+        # Ensure the produced shared library matches Python's expected
+        # ABI-tagged extension suffix (e.g. .cpython-312-darwin.so).
+        SUFFIX "${Python3_EXTENSION_MODULE_SUFFIX}"
     )
     
     # Installation
