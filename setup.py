@@ -75,7 +75,7 @@ class CMakeBuild(build_ext):
 
 setup(
     name="marmotVM",
-    version="1.0.0",
+    version="0.1.0",
     description="marmotVM - secure custom bytecode virtual machine (C extension)",
     long_description="",
     ext_modules=[CMakeExtension("marmotVM")],

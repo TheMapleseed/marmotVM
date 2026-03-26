@@ -3,7 +3,7 @@
 # Python: cmake -DBUILD_PYTHON=ON -DCMAKE_C_COMPILER=clang ..
 
 cmake_minimum_required(VERSION 3.20)
-project(marmotVM VERSION 1.0.0 LANGUAGES C)
+project(marmotVM VERSION 0.1.0 LANGUAGES C)
 
 # Use Clang compiler
 set(CMAKE_C_COMPILER "clang" CACHE STRING "C compiler" FORCE)

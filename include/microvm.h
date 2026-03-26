@@ -2,7 +2,7 @@
  * @file microvm.h
  * @brief BigWeiner MicroVM - Secure Execution Environment
  * @author BigWeiner Team
- * @version 1.0.0
+ * @version 0.1.0
  * 
  * C23 compliant micro-VM library for secure Python module execution.
  * Supports custom bytecode execution with network, GPU, and environment access.
@@ -42,10 +42,10 @@
 #endif
 
 /* Version info */
-#define MICROVM_VERSION_MAJOR 1
+#define MICROVM_VERSION_MAJOR 0
 #define MICROVM_VERSION_MINOR 0
 #define MICROVM_VERSION_PATCH 0
-#define MICROVM_VERSION_STRING "1.0.0"
+#define MICROVM_VERSION_STRING "0.1.0"
 
 /* Config flags */
 #define MICROVM_FLAG_ECC_ENABLED 0x00000001u

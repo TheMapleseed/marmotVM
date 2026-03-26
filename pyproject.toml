@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "marmotVM"
-version = "1.0.0"
+version = "0.1.0"
 description = "marmotVM - secure custom bytecode virtual machine (C extension)"
 readme = "README.md"
 license = { text = "GPL-3.0-only" }
