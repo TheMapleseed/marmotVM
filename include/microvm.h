@@ -45,6 +45,9 @@
 #define MICROVM_VERSION_PATCH 0
 #define MICROVM_VERSION_STRING "1.0.0"
 
+/* Config flags */
+#define MICROVM_FLAG_ECC_ENABLED 0x00000001u
+
 /* Limits */
 #define MICROVM_MAX_REGISTERS 256
 #define MICROVM_MAX_STACK_SIZE (1024 * 1024)  /* 1MB */
@@ -52,6 +55,7 @@
 #define MICROVM_MAX_BYTECODE_SIZE (10 * 1024 * 1024)  /* 10MB */
 #define MICROVM_MAX_THREADS 64
 #define MICROVM_MAX_CALL_DEPTH 1024
+#define MICROVM_MAX_BROKER_SOCKETS 64
 
 /* Execution modes */
 typedef enum microvm_mode {
@@ -252,6 +256,9 @@ typedef struct microvm {
     microvm_mode_t mode;
     microvm_network_mode_t network_mode;
     microvm_gpu_mode_t gpu_mode;
+    bool allow_env_ops;
+    bool allow_time_ops;
+    bool allow_raw_bytecode;
     uint32_t config_flags;
     
     /* Memory */
@@ -277,6 +284,8 @@ typedef struct microvm {
     
     /* Network state (if enabled) */
     int socket_fd;
+    int broker_sockets[MICROVM_MAX_BROKER_SOCKETS];
+    bool broker_slot_used[MICROVM_MAX_BROKER_SOCKETS];
     
     /* GPU state (if enabled) */
     void *gpu_context;
@@ -292,6 +301,11 @@ typedef struct microvm {
     /* Error handling */
     microvm_error_t last_error;
     char error_message[512];
+
+    /* ECC/integrity state (enabled via MICROVM_FLAG_ECC_ENABLED). */
+    uint8_t *ecc_image;
+    size_t ecc_image_size;
+    uint32_t ecc_packet_checksum;
 } microvm_t;
 
 /* Configuration structure */
@@ -299,6 +313,9 @@ typedef struct microvm_config {
     microvm_mode_t mode;
     microvm_network_mode_t network_mode;
     microvm_gpu_mode_t gpu_mode;
+    bool allow_env_ops;
+    bool allow_time_ops;
+    bool allow_raw_bytecode;
     size_t memory_size;
     size_t stack_size;
     size_t max_bytecodes;

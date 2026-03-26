@@ -16,6 +16,7 @@
 
 #include <Python.h>
 #include <structmember.h>
+#include <stdlib.h>
 #include "microvm.h"
 
 /* Forward declarations for renamed functions */
@@ -28,6 +29,9 @@ static PyObject *py_microvm_get_state(PyObject *self, PyObject *args);
 static PyObject *py_microvm_get_cycles(PyObject *self, PyObject *args);
 static PyObject *py_microvm_set_mode(PyObject *self, PyObject *args);
 static PyObject *py_microvm_compile(PyObject *self, PyObject *args);
+static PyObject *py_microvm_get_ecc_enabled(PyObject *self, PyObject *args);
+static PyObject *py_microvm_get_ecc_packet_checksum(PyObject *self, PyObject *args);
+static PyObject *py_microvm_get_ecc_image_size(PyObject *self, PyObject *args);
 
 typedef struct {
     PyObject_HEAD
@@ -71,6 +75,9 @@ static PyMethodDef MicroVMMethods[] = {
     {"get_exit_code", py_microvm_get_exit_code, METH_NOARGS, "Get exit code"},
     {"get_state", py_microvm_get_state, METH_NOARGS, "Get VM state"},
     {"get_cycles", py_microvm_get_cycles, METH_NOARGS, "Get cycle count"},
+    {"get_ecc_enabled", py_microvm_get_ecc_enabled, METH_NOARGS, "Get whether ECC is enabled for this VM"},
+    {"get_ecc_packet_checksum", py_microvm_get_ecc_packet_checksum, METH_NOARGS, "Get ECC packet checksum (FNV-1a32)"},
+    {"get_ecc_image_size", py_microvm_get_ecc_image_size, METH_NOARGS, "Get ECC image size in parity bytes"},
     {"set_mode", py_microvm_set_mode, METH_VARARGS, "Set execution mode"},
     {"compile", py_microvm_compile, METH_VARARGS, "Compile source to bytecode"},
     {NULL, NULL, 0, NULL}
@@ -109,9 +116,37 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     char *network_str = "all";
     char *gpu_str = "disabled";
     
-    static char *kwlist[] = {"mode", "network", "gpu", NULL};
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "sss", kwlist, 
-                                     &mode_str, &network_str, &gpu_str)) {
+    char *auth_key = NULL;
+    unsigned long long memory_mb = 0;
+    static char *kwlist[] = {"mode", "network", "gpu", "auth_key", "memory_mb", NULL};
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssszk", kwlist, 
+                                     &mode_str, &network_str, &gpu_str, &auth_key, &memory_mb)) {
+        return NULL;
+    }
+
+    const char *expected_auth = getenv("MARMOTVM_AUTH_KEY");
+    if (!expected_auth || expected_auth[0] == '\0') {
+        PyErr_SetString(PyExc_RuntimeError, "MARMOTVM_AUTH_KEY is required in environment");
+        return NULL;
+    }
+    if (!auth_key) {
+        PyErr_SetString(PyExc_PermissionError, "auth_key is required");
+        return NULL;
+    }
+
+    /* Constant-time key comparison. */
+    size_t i = 0;
+    size_t a_len = strlen(expected_auth);
+    size_t b_len = strlen(auth_key);
+    size_t max_len = a_len > b_len ? a_len : b_len;
+    unsigned char diff = (unsigned char)(a_len ^ b_len);
+    for (i = 0; i < max_len; i++) {
+        unsigned char av = i < a_len ? (unsigned char)expected_auth[i] : 0u;
+        unsigned char bv = i < b_len ? (unsigned char)auth_key[i] : 0u;
+        diff |= (unsigned char)(av ^ bv);
+    }
+    if (diff != 0u) {
+        PyErr_SetString(PyExc_PermissionError, "Invalid auth_key");
         return NULL;
     }
     
@@ -138,10 +173,47 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
         .mode = mode,
         .network_mode = network,
         .gpu_mode = gpu,
+        .allow_env_ops = true,
+        .allow_time_ops = true,
+        .allow_raw_bytecode = true,
+        .config_flags = 0,
         .memory_size = MICROVM_MAX_MEMORY,
         .stack_size = MICROVM_MAX_STACK_SIZE,
         .debug_enabled = false,
     };
+
+    /* Optional per-VM memory target from Python constructor (in MB). */
+    if (memory_mb > 0) {
+        unsigned long long bytes = memory_mb * 1024ULL * 1024ULL;
+        if (bytes > (unsigned long long)MICROVM_MAX_MEMORY) {
+            bytes = (unsigned long long)MICROVM_MAX_MEMORY;
+        }
+        config.memory_size = (size_t)bytes;
+    }
+
+    /* Optional process-wide cap from environment (in MB). */
+    const char *mem_cap_env = getenv("MARMOTVM_MAX_MEMORY_MB");
+    if (mem_cap_env && mem_cap_env[0] != '\0') {
+        char *endp = NULL;
+        unsigned long long cap_mb = strtoull(mem_cap_env, &endp, 10);
+        if (endp && *endp == '\0' && cap_mb > 0) {
+            unsigned long long cap_bytes = cap_mb * 1024ULL * 1024ULL;
+            if (cap_bytes > (unsigned long long)MICROVM_MAX_MEMORY) {
+                cap_bytes = (unsigned long long)MICROVM_MAX_MEMORY;
+            }
+            if (config.memory_size > (size_t)cap_bytes) {
+                config.memory_size = (size_t)cap_bytes;
+            }
+        }
+    }
+
+    if (mode == MICROVM_MODE_SANDBOX) {
+        config.allow_env_ops = false;
+        config.allow_time_ops = false;
+        config.allow_raw_bytecode = false;
+        config.network_mode = MICROVM_NET_DISABLED;
+        config.gpu_mode = MICROVM_GPU_DISABLED;
+    }
     
     /* Initialize library if needed */
     microvm_init();
@@ -149,7 +221,7 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     /* Create VM */
     self->vm = microvm_create(&config);
     if (!self->vm) {
-        PyErr_SetString(PyExc_RuntimeError, "Failed to create VM");
+        PyErr_SetString(PyExc_RuntimeError, "Failed to create VM (permission or config denied)");
         return NULL;
     }
     
@@ -261,6 +333,33 @@ static PyObject *py_microvm_compile(PyObject *self, PyObject *args) {
     /* Placeholder for bytecode compiler */
     PyErr_SetString(PyExc_NotImplementedError, "Compiler not yet implemented");
     return NULL;
+}
+
+static PyObject *py_microvm_get_ecc_enabled(PyObject *self, PyObject *args) {
+    MicroVMObject *vm_obj = (MicroVMObject *)self;
+    if (!vm_obj->vm) {
+        Py_RETURN_FALSE;
+    }
+    if ((vm_obj->vm->config_flags & MICROVM_FLAG_ECC_ENABLED) != 0u) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+static PyObject *py_microvm_get_ecc_packet_checksum(PyObject *self, PyObject *args) {
+    MicroVMObject *vm_obj = (MicroVMObject *)self;
+    if (!vm_obj->vm) {
+        return PyLong_FromUnsignedLong(0);
+    }
+    return PyLong_FromUnsignedLong(vm_obj->vm->ecc_packet_checksum);
+}
+
+static PyObject *py_microvm_get_ecc_image_size(PyObject *self, PyObject *args) {
+    MicroVMObject *vm_obj = (MicroVMObject *)self;
+    if (!vm_obj->vm) {
+        return PyLong_FromSize_t(0);
+    }
+    return PyLong_FromSize_t(vm_obj->vm->ecc_image_size);
 }
 
 /* Module definition */

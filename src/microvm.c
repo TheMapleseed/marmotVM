@@ -105,6 +105,10 @@ static microvm_error_t microvm_relative_jump(microvm_t *vm, int8_t offset) {
 
 /* Global state */
 static bool g_microvm_initialized = false;
+static bool g_microvm_ecc_env_enabled = false;
+static bool g_microvm_net_broker_enabled = false;
+static char g_microvm_net_allow_raw[1024] = {0};
+static size_t g_microvm_memory_cap_bytes = 0;
 static const char *g_error_strings[] = {
     "Success",
     "Invalid bytecode",
@@ -126,6 +130,209 @@ static const char *g_error_strings[] = {
 /* Forward declarations */
 static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode);
 static void microvm_set_error(microvm_t *vm, microvm_error_t error, const char *msg);
+static uint32_t microvm_fnv1a32(const uint8_t *data, size_t len);
+static uint32_t microvm_read_be_u32(const uint8_t *p);
+static microvm_error_t microvm_build_ecc_image(microvm_t *vm, const uint8_t *data, size_t len);
+static microvm_error_t microvm_snapshot_process_env(microvm_t *vm);
+static const char *microvm_cached_env_get(const microvm_t *vm, const char *key);
+static microvm_error_t microvm_cached_env_set(microvm_t *vm, const char *key, const char *value);
+static int microvm_broker_alloc_handle(microvm_t *vm, int fd);
+static int microvm_broker_get_fd(const microvm_t *vm, int handle);
+static void microvm_broker_close_all(microvm_t *vm);
+static bool microvm_net_allow_match(const char *host, int port);
+
+static uint32_t microvm_fnv1a32(const uint8_t *data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint32_t)data[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static uint32_t microvm_read_be_u32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) |
+           ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) |
+           (uint32_t)p[3];
+}
+
+/* One XOR parity byte for each 32-byte payload block. */
+static microvm_error_t microvm_build_ecc_image(microvm_t *vm, const uint8_t *data, size_t len) {
+    if (!vm) return MICROVM_ERR_INVALID_STATE;
+
+    if (vm->ecc_image) {
+        free(vm->ecc_image);
+        vm->ecc_image = NULL;
+        vm->ecc_image_size = 0;
+    }
+
+    if (!data || len == 0) {
+        vm->ecc_packet_checksum = 0;
+        return MICROVM_SUCCESS;
+    }
+
+    const size_t block_size = 32;
+    size_t blocks = (len + block_size - 1) / block_size;
+    vm->ecc_image = (uint8_t *)calloc(blocks, sizeof(uint8_t));
+    if (!vm->ecc_image) {
+        return MICROVM_ERR_MEMORY;
+    }
+
+    for (size_t b = 0; b < blocks; b++) {
+        size_t start = b * block_size;
+        size_t end = start + block_size;
+        if (end > len) end = len;
+        uint8_t parity = 0;
+        for (size_t i = start; i < end; i++) {
+            parity ^= data[i];
+        }
+        vm->ecc_image[b] = parity;
+    }
+
+    vm->ecc_image_size = blocks;
+    vm->ecc_packet_checksum = microvm_fnv1a32(data, len);
+    return MICROVM_SUCCESS;
+}
+
+static const char *microvm_cached_env_get(const microvm_t *vm, const char *key) {
+    if (!vm || !key || !vm->env_vars) return NULL;
+    size_t key_len = strlen(key);
+    for (size_t i = 0; i < vm->env_count; i++) {
+        const char *entry = vm->env_vars[i];
+        if (!entry) continue;
+        if (strncmp(entry, key, key_len) == 0 && entry[key_len] == '=') {
+            return entry + key_len + 1;
+        }
+    }
+    return NULL;
+}
+
+static microvm_error_t microvm_cached_env_set(microvm_t *vm, const char *key, const char *value) {
+    if (!vm || !key || !value) return MICROVM_ERR_INVALID_STATE;
+    size_t key_len = strlen(key);
+    if (key_len == 0 || strchr(key, '=')) return MICROVM_ERR_INVALID_BYTECODE;
+
+    size_t value_len = strlen(value);
+    size_t needed = key_len + 1 + value_len + 1;
+    char *entry = (char *)malloc(needed);
+    if (!entry) return MICROVM_ERR_MEMORY;
+    memcpy(entry, key, key_len);
+    entry[key_len] = '=';
+    memcpy(entry + key_len + 1, value, value_len);
+    entry[needed - 1] = '\0';
+
+    for (size_t i = 0; i < vm->env_count; i++) {
+        const char *curr = vm->env_vars[i];
+        if (!curr) continue;
+        if (strncmp(curr, key, key_len) == 0 && curr[key_len] == '=') {
+            free(vm->env_vars[i]);
+            vm->env_vars[i] = entry;
+            return MICROVM_SUCCESS;
+        }
+    }
+
+    char **grown = (char **)realloc(vm->env_vars, sizeof(char *) * (vm->env_count + 1));
+    if (!grown) {
+        free(entry);
+        return MICROVM_ERR_MEMORY;
+    }
+    vm->env_vars = grown;
+    vm->env_vars[vm->env_count++] = entry;
+    return MICROVM_SUCCESS;
+}
+
+static microvm_error_t microvm_snapshot_process_env(microvm_t *vm) {
+    if (!vm) return MICROVM_ERR_INVALID_STATE;
+#if defined(MICROVM_PLATFORM_LINUX) || defined(MICROVM_PLATFORM_MACOS)
+    extern char **environ;
+    if (!environ) return MICROVM_SUCCESS;
+
+    size_t count = 0;
+    while (environ[count]) count++;
+    if (count == 0) return MICROVM_SUCCESS;
+
+    vm->env_vars = (char **)calloc(count, sizeof(char *));
+    if (!vm->env_vars) return MICROVM_ERR_MEMORY;
+
+    for (size_t i = 0; i < count; i++) {
+        size_t n = strlen(environ[i]);
+        vm->env_vars[i] = (char *)malloc(n + 1);
+        if (!vm->env_vars[i]) {
+            for (size_t j = 0; j < i; j++) free(vm->env_vars[j]);
+            free(vm->env_vars);
+            vm->env_vars = NULL;
+            vm->env_count = 0;
+            return MICROVM_ERR_MEMORY;
+        }
+        memcpy(vm->env_vars[i], environ[i], n + 1);
+    }
+    vm->env_count = count;
+#endif
+    return MICROVM_SUCCESS;
+}
+
+static int microvm_broker_alloc_handle(microvm_t *vm, int fd) {
+    if (!vm || fd < 0) return -1;
+    for (int i = 0; i < MICROVM_MAX_BROKER_SOCKETS; i++) {
+        if (!vm->broker_slot_used[i]) {
+            vm->broker_slot_used[i] = true;
+            vm->broker_sockets[i] = fd;
+            return i + 1; /* Opaque non-zero handle */
+        }
+    }
+    return -1;
+}
+
+static int microvm_broker_get_fd(const microvm_t *vm, int handle) {
+    if (!vm || handle <= 0) return -1;
+    int idx = handle - 1;
+    if (idx < 0 || idx >= MICROVM_MAX_BROKER_SOCKETS) return -1;
+    if (!vm->broker_slot_used[idx]) return -1;
+    return vm->broker_sockets[idx];
+}
+
+static void microvm_broker_close_all(microvm_t *vm) {
+    if (!vm) return;
+    for (int i = 0; i < MICROVM_MAX_BROKER_SOCKETS; i++) {
+        if (vm->broker_slot_used[i]) {
+#if defined(MICROVM_PLATFORM_WINDOWS)
+            closesocket(vm->broker_sockets[i]);
+#else
+            close(vm->broker_sockets[i]);
+#endif
+            vm->broker_slot_used[i] = false;
+            vm->broker_sockets[i] = -1;
+        }
+    }
+}
+
+static bool microvm_net_allow_match(const char *host, int port) {
+    if (!g_microvm_net_broker_enabled) return true;
+    if (!host || port <= 0) return false;
+    if (g_microvm_net_allow_raw[0] == '\0') return false;
+
+    char work[1024];
+    strncpy(work, g_microvm_net_allow_raw, sizeof(work) - 1);
+    work[sizeof(work) - 1] = '\0';
+
+    char want[512];
+    snprintf(want, sizeof(want), "%s:%d", host, port);
+
+    char *tok = strtok(work, ",");
+    while (tok) {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        size_t n = strlen(tok);
+        while (n > 0 && (tok[n - 1] == ' ' || tok[n - 1] == '\t')) {
+            tok[--n] = '\0';
+        }
+        if (strcmp(tok, want) == 0) {
+            return true;
+        }
+        tok = strtok(NULL, ",");
+    }
+    return false;
+}
 
 /* ============================================================================
  * Initialization
@@ -143,6 +350,47 @@ microvm_error_t microvm_init(void) {
     }
 #endif
     
+    /* Optional runtime hardening toggle from environment. */
+    const char *ecc_env = getenv("MARMOTVM_ECC");
+    if (ecc_env) {
+        if (strcmp(ecc_env, "1") == 0 ||
+            strcmp(ecc_env, "true") == 0 ||
+            strcmp(ecc_env, "TRUE") == 0 ||
+            strcmp(ecc_env, "on") == 0 ||
+            strcmp(ecc_env, "ON") == 0) {
+            g_microvm_ecc_env_enabled = true;
+        }
+    }
+
+    const char *broker_env = getenv("MARMOTVM_NET_BROKER");
+    if (broker_env && (
+        strcmp(broker_env, "1") == 0 ||
+        strcmp(broker_env, "true") == 0 ||
+        strcmp(broker_env, "TRUE") == 0 ||
+        strcmp(broker_env, "on") == 0 ||
+        strcmp(broker_env, "ON") == 0)) {
+        g_microvm_net_broker_enabled = true;
+    }
+    const char *allow_env = getenv("MARMOTVM_NET_ALLOW");
+    if (allow_env && allow_env[0] != '\0') {
+        strncpy(g_microvm_net_allow_raw, allow_env, sizeof(g_microvm_net_allow_raw) - 1);
+        g_microvm_net_allow_raw[sizeof(g_microvm_net_allow_raw) - 1] = '\0';
+    }
+
+    const char *mem_cap_env = getenv("MARMOTVM_MAX_MEMORY_MB");
+    if (mem_cap_env && mem_cap_env[0] != '\0') {
+        char *endp = NULL;
+        unsigned long long mb = strtoull(mem_cap_env, &endp, 10);
+        if (endp && *endp == '\0' && mb > 0) {
+            unsigned long long bytes = mb * 1024ULL * 1024ULL;
+            if (bytes > (unsigned long long)SIZE_MAX) {
+                g_microvm_memory_cap_bytes = SIZE_MAX;
+            } else {
+                g_microvm_memory_cap_bytes = (size_t)bytes;
+            }
+        }
+    }
+
     g_microvm_initialized = true;
     return MICROVM_SUCCESS;
 }
@@ -166,6 +414,10 @@ microvm_t *microvm_create(const microvm_config_t *config) {
         vm->mode = config->mode;
         vm->network_mode = config->network_mode;
         vm->gpu_mode = config->gpu_mode;
+        vm->allow_env_ops = config->allow_env_ops;
+        vm->allow_time_ops = config->allow_time_ops;
+        vm->allow_raw_bytecode = config->allow_raw_bytecode;
+        vm->config_flags = config->config_flags;
         vm->memory_size = config->memory_size > 0 ? config->memory_size : MICROVM_MAX_MEMORY;
         /* Reserve stack region and heap guard bytes to avoid heap overruns. */
         size_t stack_reserve = config->stack_size > 0 ? config->stack_size : MICROVM_MAX_STACK_SIZE;
@@ -178,8 +430,40 @@ microvm_t *microvm_create(const microvm_config_t *config) {
         vm->mode = MICROVM_MODE_USER;
         vm->network_mode = MICROVM_NET_ALL;
         vm->gpu_mode = MICROVM_GPU_DISABLED;
+        vm->allow_env_ops = true;
+        vm->allow_time_ops = true;
+        vm->allow_raw_bytecode = true;
+        vm->config_flags = 0;
         vm->memory_size = MICROVM_MAX_MEMORY;
         vm->stack_ptr = vm->memory_size - MICROVM_MAX_STACK_SIZE - MICROVM_HEAP_GUARD_BYTES;
+    }
+
+    /* Enforce process-wide memory ceiling if configured. */
+    if (g_microvm_memory_cap_bytes > 0 && vm->memory_size > g_microvm_memory_cap_bytes) {
+        vm->memory_size = g_microvm_memory_cap_bytes;
+    }
+
+    if (g_microvm_ecc_env_enabled) {
+        vm->config_flags |= MICROVM_FLAG_ECC_ENABLED;
+    }
+
+    /* Sandbox policy is deny-by-default for privileged host integrations. */
+    if (vm->mode == MICROVM_MODE_SANDBOX) {
+        vm->network_mode = MICROVM_NET_DISABLED;
+        vm->gpu_mode = MICROVM_GPU_DISABLED;
+        vm->allow_env_ops = false;
+        vm->allow_time_ops = false;
+        vm->allow_raw_bytecode = false;
+    }
+
+    /* Kernel mode must be explicitly privileged on Unix-like platforms. */
+    if (vm->mode == MICROVM_MODE_KERNEL) {
+#if defined(MICROVM_PLATFORM_LINUX) || defined(MICROVM_PLATFORM_MACOS)
+        if (geteuid() != 0) {
+            free(vm);
+            return NULL;
+        }
+#endif
     }
     
     /* Allocate memory */
@@ -196,10 +480,28 @@ microvm_t *microvm_create(const microvm_config_t *config) {
     vm->call_depth = 0;
     vm->instructions_executed = 0;
     vm->cycles = 0;
+    vm->ecc_image = NULL;
+    vm->ecc_image_size = 0;
+    vm->ecc_packet_checksum = 0;
+    vm->env_vars = NULL;
+    vm->env_count = 0;
+    for (int i = 0; i < MICROVM_MAX_BROKER_SOCKETS; i++) {
+        vm->broker_sockets[i] = -1;
+        vm->broker_slot_used[i] = false;
+    }
     
     /* Initialize registers */
     memset(&vm->regs, 0, sizeof(vm->regs));
     memset(&vm->cpu_flags, 0, sizeof(vm->cpu_flags));
+
+    /* Snapshot process environment into VM-local cache for this instance. */
+    if (vm->allow_env_ops) {
+        microvm_error_t e = microvm_snapshot_process_env(vm);
+        if (e != MICROVM_SUCCESS) {
+            microvm_destroy(vm);
+            return NULL;
+        }
+    }
     
     return vm;
 }
@@ -212,6 +514,11 @@ microvm_error_t microvm_destroy(microvm_t *vm) {
     /* Free memory */
     if (vm->memory) {
         free(vm->memory);
+    }
+    microvm_broker_close_all(vm);
+
+    if (vm->ecc_image) {
+        free(vm->ecc_image);
     }
     
     /* Free environment */
@@ -257,13 +564,47 @@ microvm_error_t microvm_load(microvm_t *vm, const uint8_t *bytecode, size_t size
     vm->instructions_executed = 0;
     vm->cycles = 0;
     vm->heap_ptr = size; /* Keep bytecode intact; allocate after it. */
+    if (vm->ecc_image) {
+        free(vm->ecc_image);
+        vm->ecc_image = NULL;
+        vm->ecc_image_size = 0;
+    }
+    vm->ecc_packet_checksum = 0;
 
     /* Check magic number */
+    bool has_valid_magic = false;
     if (size >= 4) {
         uint32_t magic = (bytecode[0] << 24) | (bytecode[1] << 16) | 
                         (bytecode[2] << 8) | bytecode[3];
         if (magic != MICROVM_BYTECODE_MAGIC) {
-            /* Allow loading even without magic (raw bytecode) */
+            if (!vm->allow_raw_bytecode) {
+                return MICROVM_ERR_INVALID_BYTECODE;
+            }
+        } else {
+            has_valid_magic = true;
+        }
+    } else if (!vm->allow_raw_bytecode) {
+        return MICROVM_ERR_INVALID_BYTECODE;
+    }
+
+    if ((vm->config_flags & MICROVM_FLAG_ECC_ENABLED) != 0u) {
+        const size_t header_size = sizeof(microvm_header_t);
+        if (!has_valid_magic || size <= header_size || header_size < 48) {
+            return MICROVM_ERR_INVALID_BYTECODE;
+        }
+
+        /* Header checksum field is expected at bytes 44..47 (big-endian). */
+        uint32_t expected_checksum = microvm_read_be_u32(&bytecode[44]);
+        const uint8_t *payload = bytecode + header_size;
+        size_t payload_size = size - header_size;
+        uint32_t actual_checksum = microvm_fnv1a32(payload, payload_size);
+        if (expected_checksum != actual_checksum) {
+            return MICROVM_ERR_INVALID_BYTECODE;
+        }
+
+        microvm_error_t eerr = microvm_build_ecc_image(vm, payload, payload_size);
+        if (eerr != MICROVM_SUCCESS) {
+            return eerr;
         }
     }
     
@@ -671,7 +1012,7 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
         }
         
         /* ===== Network Operations ===== */
-#ifdef MICROVM_PLATFORM_LINUX
+#if defined(MICROVM_PLATFORM_LINUX) || defined(MICROVM_PLATFORM_MACOS)
         case OP_NET_SOCKET: {
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
@@ -680,15 +1021,28 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             uint8_t dest = mem[vm->pc++];
             int domain = vm->regs.r[0];  /* AF_INET */
             int type = vm->regs.r[1];    /* SOCK_STREAM */
-            vm->regs.r[dest] = socket(domain, type, 0);
-            if (vm->regs.r[dest] < 0) {
+            int fd = socket(domain, type, 0);
+            if (fd < 0) {
                 return MICROVM_ERR_NETWORK;
+            }
+            if (g_microvm_net_broker_enabled) {
+                int handle = microvm_broker_alloc_handle(vm, fd);
+                if (handle < 0) {
+                    close(fd);
+                    return MICROVM_ERR_NETWORK;
+                }
+                vm->regs.r[dest] = handle;
+            } else {
+                vm->regs.r[dest] = fd;
             }
             break;
         }
         
         case OP_NET_BIND: {
             if (vm->network_mode == MICROVM_NET_DISABLED) {
+                return MICROVM_ERR_PERMISSION;
+            }
+            if (g_microvm_net_broker_enabled) {
                 return MICROVM_ERR_PERMISSION;
             }
             int sockfd = vm->regs.r[0];
@@ -710,6 +1064,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
             }
+            if (g_microvm_net_broker_enabled) {
+                return MICROVM_ERR_PERMISSION;
+            }
             int sockfd = vm->regs.r[0];
             int backlog = (int)vm->regs.r[1];
             
@@ -721,6 +1078,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
         
         case OP_NET_ACCEPT: {
             if (vm->network_mode == MICROVM_NET_DISABLED) {
+                return MICROVM_ERR_PERMISSION;
+            }
+            if (g_microvm_net_broker_enabled) {
                 return MICROVM_ERR_PERMISSION;
             }
             if (microvm_require_pc_bytes(vm, 1) != MICROVM_SUCCESS) return MICROVM_ERR_OUT_OF_BOUNDS;
@@ -737,16 +1097,33 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
             }
-            int sockfd = vm->regs.r[0];
-            
-            /* For simplicity, assumes hostname in r1, port in r2 */
-            /* Full implementation would use gethostbyname */
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            /* addr would be resolved from hostname */
-            
-            if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            int sock_token = (int)vm->regs.r[0];
+            size_t host_off = (size_t)vm->regs.r[1];
+            int port = (int)vm->regs.r[2];
+            char host_buf[256];
+            microvm_error_t herr = microvm_copy_cstring_from_vm(vm, host_off, host_buf, sizeof(host_buf));
+            if (herr != MICROVM_SUCCESS) return herr;
+
+            if (!microvm_net_allow_match(host_buf, port)) {
+                return MICROVM_ERR_PERMISSION;
+            }
+
+            int sockfd = g_microvm_net_broker_enabled ? microvm_broker_get_fd(vm, sock_token) : sock_token;
+            if (sockfd < 0) return MICROVM_ERR_NETWORK;
+
+            char port_buf[16];
+            snprintf(port_buf, sizeof(port_buf), "%d", port);
+            struct addrinfo hints;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_STREAM;
+            struct addrinfo *res = NULL;
+            if (getaddrinfo(host_buf, port_buf, &hints, &res) != 0 || !res) {
+                return MICROVM_ERR_NETWORK;
+            }
+            int rc = connect(sockfd, res->ai_addr, res->ai_addrlen);
+            freeaddrinfo(res);
+            if (rc < 0) {
                 return MICROVM_ERR_NETWORK;
             }
             break;
@@ -756,7 +1133,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
             }
-            int sockfd = vm->regs.r[0];
+            int sock_token = (int)vm->regs.r[0];
+            int sockfd = g_microvm_net_broker_enabled ? microvm_broker_get_fd(vm, sock_token) : sock_token;
+            if (sockfd < 0) return MICROVM_ERR_NETWORK;
             size_t buf_off = (size_t)vm->regs.r[1];
             size_t len = (size_t)vm->regs.r[2];
             if (buf_off >= vm->memory_size || len > vm->memory_size - buf_off) {
@@ -776,7 +1155,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
             }
-            int sockfd = vm->regs.r[0];
+            int sock_token = (int)vm->regs.r[0];
+            int sockfd = g_microvm_net_broker_enabled ? microvm_broker_get_fd(vm, sock_token) : sock_token;
+            if (sockfd < 0) return MICROVM_ERR_NETWORK;
             size_t buf_off = (size_t)vm->regs.r[1];
             size_t len = (size_t)vm->regs.r[2];
             if (buf_off >= vm->memory_size || len > vm->memory_size - buf_off) {
@@ -796,14 +1177,28 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (vm->network_mode == MICROVM_NET_DISABLED) {
                 return MICROVM_ERR_PERMISSION;
             }
-            int sockfd = vm->regs.r[0];
-            close(sockfd);
+            int sock_token = (int)vm->regs.r[0];
+            if (g_microvm_net_broker_enabled) {
+                int idx = sock_token - 1;
+                if (idx < 0 || idx >= MICROVM_MAX_BROKER_SOCKETS || !vm->broker_slot_used[idx]) {
+                    return MICROVM_ERR_NETWORK;
+                }
+                close(vm->broker_sockets[idx]);
+                vm->broker_slot_used[idx] = false;
+                vm->broker_sockets[idx] = -1;
+            } else {
+                int sockfd = sock_token;
+                close(sockfd);
+            }
             break;
         }
 #endif
         
         /* ===== Environment Operations ===== */
         case OP_ENV_GET: {
+            if (!vm->allow_env_ops) {
+                return MICROVM_ERR_PERMISSION;
+            }
             if (microvm_require_pc_bytes(vm, 1) != MICROVM_SUCCESS) return MICROVM_ERR_OUT_OF_BOUNDS;
             uint8_t dest = mem[vm->pc++];
 
@@ -813,7 +1208,7 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             microvm_error_t kerr = microvm_copy_cstring_from_vm(vm, key_off, key_buf, sizeof(key_buf));
             if (kerr != MICROVM_SUCCESS) return kerr;
 
-            const char *value = getenv(key_buf);
+            const char *value = microvm_cached_env_get(vm, key_buf);
             if (value) {
                 /* Store string in VM memory */
                 size_t len = strlen(value) + 1;
@@ -830,6 +1225,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
         }
         
         case OP_ENV_SET: {
+            if (!vm->allow_env_ops) {
+                return MICROVM_ERR_PERMISSION;
+            }
             /* vm->regs.r[0]/r[1] hold offsets into VM memory. */
             size_t key_off = (size_t)vm->regs.r[0];
             size_t val_off = (size_t)vm->regs.r[1];
@@ -839,12 +1237,16 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
             if (kerr != MICROVM_SUCCESS) return kerr;
             microvm_error_t verr = microvm_copy_cstring_from_vm(vm, val_off, val_buf, sizeof(val_buf));
             if (verr != MICROVM_SUCCESS) return verr;
-            setenv(key_buf, val_buf, 1);
+            microvm_error_t serr = microvm_cached_env_set(vm, key_buf, val_buf);
+            if (serr != MICROVM_SUCCESS) return serr;
             break;
         }
         
         /* ===== Time Operations ===== */
         case OP_GETTIME: {
+            if (!vm->allow_time_ops) {
+                return MICROVM_ERR_PERMISSION;
+            }
             if (microvm_require_pc_bytes(vm, 1) != MICROVM_SUCCESS) return MICROVM_ERR_OUT_OF_BOUNDS;
             uint8_t dest = mem[vm->pc++];
             int clock_id = (int)vm->regs.r[0];
@@ -857,6 +1259,9 @@ static microvm_error_t microvm_execute_op(microvm_t *vm, microvm_opcode_t opcode
         }
         
         case OP_GETPID: {
+            if (!vm->allow_time_ops) {
+                return MICROVM_ERR_PERMISSION;
+            }
             if (microvm_require_pc_bytes(vm, 1) != MICROVM_SUCCESS) return MICROVM_ERR_OUT_OF_BOUNDS;
             uint8_t dest = mem[vm->pc++];
 #ifdef MICROVM_PLATFORM_LINUX
@@ -920,9 +1325,21 @@ microvm_error_t microvm_set_mode(microvm_t *vm, microvm_mode_t mode) {
     
     /* Check permissions for kernel mode */
     if (mode == MICROVM_MODE_KERNEL) {
-        /* Would check for root privileges here */
+#if defined(MICROVM_PLATFORM_LINUX) || defined(MICROVM_PLATFORM_MACOS)
+        if (geteuid() != 0) {
+            return MICROVM_ERR_PERMISSION;
+        }
+#endif
     }
-    
+
+    if (mode == MICROVM_MODE_SANDBOX) {
+        vm->network_mode = MICROVM_NET_DISABLED;
+        vm->gpu_mode = MICROVM_GPU_DISABLED;
+        vm->allow_env_ops = false;
+        vm->allow_time_ops = false;
+        vm->allow_raw_bytecode = false;
+    }
+
     vm->mode = mode;
     return MICROVM_SUCCESS;
 }

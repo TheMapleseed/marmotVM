@@ -54,7 +54,13 @@ pip install marmotVM
 import marmotVM
 
 # Create VM with sandbox mode
-vm = marmotVM.MicroVM(mode='user', network='tcp', gpu='disabled')
+vm = marmotVM.MicroVM(
+    mode='user',
+    network='tcp',
+    gpu='disabled',
+    auth_key='your-secret-key',
+    memory_mb=64,
+)
 
 # Load bytecode
 with open('program.mvm', 'rb') as f:
@@ -64,6 +70,128 @@ with open('program.mvm', 'rb') as f:
 exit_code = vm.run()
 print(f"Exit code: {exit_code}")
 print(f"Cycles: {vm.get_cycles()}")
+```
+
+## Feature switches and defaults
+
+Use this section as the source of truth for enabling new security/integrity features.
+
+### 1) VM creation authentication (required)
+
+`marmotVM` now requires a creation key for every VM instance.
+
+- Environment variable: `MARMOTVM_AUTH_KEY`
+- Python constructor arg: `auth_key=...`
+- VM creation succeeds only when `auth_key` exactly matches `MARMOTVM_AUTH_KEY`
+
+Example:
+
+```bash
+export MARMOTVM_AUTH_KEY="change-me-strong-secret"
+```
+
+```python
+import marmotVM
+vm = marmotVM.MicroVM(auth_key="change-me-strong-secret")
+```
+
+### 2) ECC packet integrity mode (disabled by default)
+
+ECC integrity verification is opt-in and controlled at startup:
+
+- Environment variable: `MARMOTVM_ECC`
+- Enabled values: `1`, `true`, `on` (case-insensitive variants currently supported in code)
+- Default when unset: disabled
+
+When ECC is enabled, `vm.load(packet)` requires a valid packet/header checksum flow (documented below).
+
+```bash
+export MARMOTVM_ECC=1
+```
+
+### 2b) Network broker mode (disabled by default)
+
+Network broker mode keeps network opcodes mediated by broker-managed opaque handles.
+
+- Environment variable: `MARMOTVM_NET_BROKER`
+- Enabled values: `1`, `true`, `on`
+- Allowlist variable: `MARMOTVM_NET_ALLOW`
+- Allowlist format: comma-separated `host:port` entries
+
+Example:
+
+```bash
+export MARMOTVM_NET_BROKER=1
+export MARMOTVM_NET_ALLOW="api.example.com:443,10.0.0.15:9000"
+```
+
+Behavior in broker mode:
+
+- `NET_SOCKET` returns opaque handle (not raw host fd)
+- `NET_CONNECT` is blocked unless `host:port` is allowlisted
+- `NET_SEND` / `NET_RECV` resolve opaque handle internally
+- `NET_BIND` / `NET_LISTEN` / `NET_ACCEPT` are denied
+
+### 2c) RAM limit / memory ceiling
+
+You can cap VM memory so the runtime cannot over-allocate RAM.
+
+- Process-wide env cap: `MARMOTVM_MAX_MEMORY_MB`
+- Optional per-VM target: `memory_mb=` constructor arg
+- Effective VM memory is the smaller of:
+  - constructor `memory_mb` (if provided)
+  - `MARMOTVM_MAX_MEMORY_MB` (if set)
+  - internal hard max (`MICROVM_MAX_MEMORY`)
+
+Example:
+
+```bash
+export MARMOTVM_MAX_MEMORY_MB=64
+```
+
+```python
+vm = marmotVM.MicroVM(
+    mode="sandbox",
+    auth_key="change-me-strong-secret",
+    memory_mb=32,  # <= env cap, so VM gets 32MB
+)
+```
+
+### 3) Execution mode policy (constructor option)
+
+- `mode='user'`:
+  - normal user-mode runtime
+  - raw bytecode loading allowed
+  - host integrations follow selected network/gpu options
+  - process environment is snapshotted into VM-local cache at VM creation
+- `mode='sandbox'`:
+  - deny-by-default host integrations enforced in runtime
+  - network forced disabled
+  - GPU forced disabled
+  - env/time/pid operations blocked
+  - raw bytecode loading blocked
+- `mode='kernel'`:
+  - requires privileged user context on Unix-like hosts
+  - creation denied if privilege check fails
+
+### 4) Effective secure startup profile
+
+For the strictest currently implemented profile:
+
+```bash
+export MARMOTVM_AUTH_KEY="change-me-strong-secret"
+export MARMOTVM_ECC=1
+export MARMOTVM_NET_BROKER=1
+export MARMOTVM_NET_ALLOW="api.example.com:443"
+export MARMOTVM_MAX_MEMORY_MB=64
+```
+
+```python
+import marmotVM
+vm = marmotVM.MicroVM(
+    mode="sandbox",
+    auth_key="change-me-strong-secret",
+)
 ```
 
 ## Local development build (maintainers)
@@ -141,12 +269,53 @@ Offset  Size  Field
 
 ## Security
 
-The MicroVM provides isolation through:
+Current security model:
 
-1. **Memory Limits**: Bounded heap/stack (configurable)
-2. **No Direct Hardware Access**: Sandboxed I/O via syscalls
-3. **Execution Modes**: Kernel mode requires elevated privileges
-4. **Network Isolation**: Can be disabled entirely
+1. **In-process runtime**: `marmotVM` executes as a native extension inside the Python process.
+2. **Sandbox mode policy**: sandbox mode now forces deny-by-default host integrations:
+   - network disabled
+   - GPU disabled
+   - env/time/pid operations blocked
+   - raw bytecode loading blocked (magic required)
+3. **Kernel mode guard**: kernel mode requires privileged user context on Unix-like hosts.
+4. **Creation auth gate**: VM creation requires `auth_key` that matches `MARMOTVM_AUTH_KEY`.
+5. **ECC startup flag**: set `MARMOTVM_ECC=1` (or `true`/`on`) before startup to enable ECC flag on new VMs.
+
+Important: this is a hardened interpreter policy, not full OS-level process/container isolation.
+
+### Required environment variables
+
+```bash
+export MARMOTVM_AUTH_KEY="change-me"
+export MARMOTVM_ECC=1   # optional: enables ECC flag on VM startup
+```
+
+### ECC packet behavior
+
+When ECC is enabled, `vm.load(packet)` enforces packet integrity:
+
+- packet must include a valid MicroVM header (magic required)
+- header checksum field (bytes `44..47`, big-endian) must equal FNV-1a32 over payload bytes after the header
+- VM builds an internal ECC image (1 parity byte per 32 payload bytes)
+- checksum mismatch or malformed packet causes load rejection
+
+Inspection helpers:
+
+```python
+vm.get_ecc_enabled()
+vm.get_ecc_packet_checksum()
+vm.get_ecc_image_size()
+```
+
+### VM-local environment cache lifecycle
+
+Environment handling is now VM-local for isolation:
+
+- at VM creation, process environment is copied into a VM-local cache
+- `OP_ENV_GET` reads from that VM cache (not host `getenv`)
+- `OP_ENV_SET` writes to that VM cache (not host `setenv`)
+- when VM is destroyed, the cache is freed
+- next startup gets a fresh snapshot
 
 ## License
 
