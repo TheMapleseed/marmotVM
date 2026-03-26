@@ -7,7 +7,7 @@
  * C23 compliant micro-VM library for secure Python module execution.
  * Supports custom bytecode execution with network, GPU, and environment access.
  * 
- * License: MIT
+ * License: GPL-3.0-only
  */
 
 #ifndef MICROVM_H

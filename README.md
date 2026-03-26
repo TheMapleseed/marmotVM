@@ -175,4 +175,4 @@ The MicroVM provides isolation through:
 
 ## License
 
-MIT
+GNU GPL v3.0 (GPL-3.0-only)
