@@ -1,6 +1,6 @@
-# BigWeiner MicroVM
+# marmotVM
 
-A C23 compliant custom bytecode virtual machine library designed for secure Python module execution.
+`marmotVM` is a Python package that ships a native C extension for running a custom bytecode virtual machine from Python.
 
 ## Features
 
@@ -23,7 +23,7 @@ A C23 compliant custom bytecode virtual machine library designed for secure Pyth
          |
          v
 +--------+---------+
-|  microvm Python |
+| marmotVM Python |
 |    Module       |
 +--------+---------+
          |
@@ -42,59 +42,19 @@ A C23 compliant custom bytecode virtual machine library designed for secure Pyth
  +------+ +------+
 ```
 
-## Building
+## Install (pip)
 
-### Build the C library only:
 ```bash
-cd microvm
-mkdir build && cd build
-cmake ..
-make
+pip install marmotVM
 ```
 
-### Build with Python bindings:
-```bash
-cmake -DBUILD_PYTHON=ON ..
-make
-```
+## Python usage
 
-## Usage
-
-### C Usage:
-```c
-#include "microvm.h"
-
-int main() {
-    microvm_init();
-    
-    microvm_config_t config = {
-        .mode = MICROVM_MODE_USER,
-        .network_mode = MICROVM_NET_TCP,
-        .gpu_mode = MICROVM_GPU_DISABLED,
-    };
-    
-    microvm_t *vm = microvm_create(&config);
-    
-    // Load bytecode
-    uint8_t bytecode[] = { /* ... */ };
-    microvm_load(vm, bytecode, sizeof(bytecode));
-    
-    // Run
-    microvm_run(vm);
-    
-    printf("Exit code: %d\n", microvm_get_exit_code(vm));
-    
-    microvm_destroy(vm);
-    return 0;
-}
-```
-
-### Python Usage:
 ```python
-import microvm
+import marmotVM
 
 # Create VM with sandbox mode
-vm = microvm.MicroVM(mode='user', network='tcp', gpu='disabled')
+vm = marmotVM.MicroVM(mode='user', network='tcp', gpu='disabled')
 
 # Load bytecode
 with open('program.mvm', 'rb') as f:
@@ -104,6 +64,21 @@ with open('program.mvm', 'rb') as f:
 exit_code = vm.run()
 print(f"Exit code: {exit_code}")
 print(f"Cycles: {vm.get_cycles()}")
+```
+
+## Local development build (maintainers)
+
+If you are developing the package itself (not consuming from pip):
+
+```bash
+python -m pip install --upgrade pip build
+python -m build
+```
+
+Or editable install:
+
+```bash
+python -m pip install -e .
 ```
 
 ## Bytecode Format

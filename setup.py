@@ -45,7 +45,7 @@ class CMakeBuild(build_ext):
         subprocess.check_call(cmake_configure_args, cwd=build_temp)
 
         subprocess.check_call(
-            ["cmake", "--build", build_temp, "--config", cfg, "--target", "microvm_module"],
+            ["cmake", "--build", build_temp, "--config", cfg, "--target", "marmotvm_module"],
             cwd=build_temp,
         )
 
@@ -55,10 +55,16 @@ class CMakeBuild(build_ext):
         if not matches:
             # Fall back to the extension name without ABI tag (in case the CMake
             # suffix property isn't applied as expected).
-            fallback = glob(os.path.join(build_temp, "**", f"{ext.name}*.so"), recursive=True)
+            fallback = glob(os.path.join(build_temp, "**", f"{ext.name}*"), recursive=True)
+            fallback = [p for p in fallback if os.path.isfile(p)]
+            if fallback:
+                built_path = fallback[0]
+                os.makedirs(os.path.dirname(ext_fullpath), exist_ok=True)
+                self.copy_file(built_path, ext_fullpath)
+                return
             raise FileNotFoundError(
                 f"Could not find built extension {ext_filename}. "
-                f"Fallback matches for {ext.name}*.so: {fallback}"
+                f"Fallback matches for {ext.name}*: {fallback}"
             )
 
         built_path = matches[0]
@@ -70,9 +76,9 @@ class CMakeBuild(build_ext):
 setup(
     name="marmotVM",
     version="1.0.0",
-    description="BigWeiner MicroVM - Secure Python module execution (C extension)",
+    description="marmotVM - secure custom bytecode virtual machine (C extension)",
     long_description="",
-    ext_modules=[CMakeExtension("microvm")],
+    ext_modules=[CMakeExtension("marmotVM")],
     cmdclass={"build_ext": CMakeBuild},
     zip_safe=False,
 )

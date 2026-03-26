@@ -6,9 +6,9 @@
  * allowing Python applications to create secure execution environments.
  * 
  * Usage:
- *     import microvm
+ *     import marmotVM
  *     
- *     vm = microvm.create(mode='user', network='tcp', gpu='disabled')
+ *     vm = marmotVM.create(mode='user', network='tcp', gpu='disabled')
  *     vm.load(bytecode)
  *     vm.run()
  *     print(vm.get_exit_code())
@@ -79,7 +79,7 @@ static PyMethodDef MicroVMMethods[] = {
 /* Type definition */
 static PyTypeObject MicroVMType = {
     PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name = "microvm.MicroVM",
+    .tp_name = "marmotVM.MicroVM",
     .tp_doc = "MicroVM - Secure Execution Environment",
     .tp_basicsize = sizeof(MicroVMObject),
     .tp_itemsize = 0,
@@ -266,13 +266,13 @@ static PyObject *py_microvm_compile(PyObject *self, PyObject *args) {
 /* Module definition */
 static struct PyModuleDef microvmmodule = {
     PyModuleDef_HEAD_INIT,
-    "microvm",
-    "BigWeiner MicroVM - Secure Python module execution",
+    "marmotVM",
+    "marmotVM - Secure Python module execution",
     -1,
     NULL
 };
 
-PyMODINIT_FUNC PyInit_microvm(void) {
+PyMODINIT_FUNC PyInit_marmotVM(void) {
     PyObject *module;
     
     module = PyModule_Create(&microvmmodule);

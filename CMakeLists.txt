@@ -1,9 +1,9 @@
-# BigWeiner MicroVM CMakeLists.txt
+# marmotVM CMakeLists.txt
 # Build: mkdir build && cd build && cmake -DCMAKE_C_COMPILER=clang .. && make
 # Python: cmake -DBUILD_PYTHON=ON -DCMAKE_C_COMPILER=clang ..
 
 cmake_minimum_required(VERSION 3.20)
-project(microvm VERSION 1.0.0 LANGUAGES C)
+project(marmotVM VERSION 1.0.0 LANGUAGES C)
 
 # Use Clang compiler
 set(CMAKE_C_COMPILER "clang" CACHE STRING "C compiler" FORCE)
@@ -57,7 +57,7 @@ install(FILES ${MICROVM_HEADERS} DESTINATION include)
 # Python binding option
 option(BUILD_PYTHON "Build Python bindings" OFF)
 if(BUILD_PYTHON)
-    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+    find_package(Python3 COMPONENTS Interpreter Development.Module REQUIRED)
     
     # Get Python include and library paths
     execute_process(
@@ -78,29 +78,39 @@ if(BUILD_PYTHON)
     set(PYTHON_SOURCES src/microvm_python.c)
     
     # Create the Python extension module
-    add_library(microvm_module MODULE ${PYTHON_SOURCES})
+    add_library(marmotvm_module MODULE ${PYTHON_SOURCES})
     
-    target_include_directories(microvm_module PRIVATE 
+    target_include_directories(marmotvm_module PRIVATE 
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${Python3_INCLUDE_DIR}
     )
     
-    target_link_libraries(microvm_module PRIVATE 
+    target_link_libraries(marmotvm_module PRIVATE
         microvm
         pthread
     )
+    if(TARGET Python3::Module)
+        target_link_libraries(marmotvm_module PRIVATE Python3::Module)
+    elseif(TARGET Python3::Python)
+        target_link_libraries(marmotvm_module PRIVATE Python3::Python)
+    endif()
+
+    # On macOS, extension modules commonly resolve Python API symbols at runtime.
+    if(APPLE)
+        target_link_options(marmotvm_module PRIVATE "-undefined" "dynamic_lookup")
+    endif()
     
-    # Set module name to match Python import (microvm.so)
-    set_target_properties(microvm_module PROPERTIES 
+    # Set module name to match Python import (marmotVM.so)
+    set_target_properties(marmotvm_module PROPERTIES 
         PREFIX ""
-        OUTPUT_NAME "microvm"
+        OUTPUT_NAME "marmotVM"
         # Ensure the produced shared library matches Python's expected
         # ABI-tagged extension suffix (e.g. .cpython-312-darwin.so).
         SUFFIX "${Python3_EXTENSION_MODULE_SUFFIX}"
     )
     
     # Installation
-    install(TARGETS microvm_module 
+    install(TARGETS marmotvm_module 
             LIBRARY DESTINATION ${Python3_SITEARCH}
             COMPONENT RuntimeLibraries)
     
