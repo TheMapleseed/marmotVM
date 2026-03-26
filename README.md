@@ -102,11 +102,13 @@ ECC integrity verification is opt-in and controlled at startup:
 - Environment variable: `MARMOTVM_ECC`
 - Enabled values: `1`, `true`, `on` (case-insensitive variants currently supported in code)
 - Default when unset: disabled
+- Required keyed mode env when ECC is enabled: `MARMOTVM_ECC_KEY`
 
 When ECC is enabled, `vm.load(packet)` requires a valid packet/header checksum flow (documented below).
 
 ```bash
 export MARMOTVM_ECC=1
+export MARMOTVM_ECC_KEY="replace-with-strong-secret"
 ```
 
 ### 2b) Network broker mode (disabled by default)
@@ -129,6 +131,7 @@ Behavior in broker mode:
 
 - `NET_SOCKET` returns opaque handle (not raw host fd)
 - `NET_CONNECT` is blocked unless `host:port` is allowlisted
+- allowlist enforcement is validated against resolved endpoint addresses at connect time
 - `NET_SEND` / `NET_RECV` resolve opaque handle internally
 - `NET_BIND` / `NET_LISTEN` / `NET_ACCEPT` are denied
 
@@ -171,8 +174,16 @@ vm = marmotVM.MicroVM(
   - env/time/pid operations blocked
   - raw bytecode loading blocked
 - `mode='kernel'`:
-  - requires privileged user context on Unix-like hosts
-  - creation denied if privilege check fails
+  - disabled by runtime security policy in this build
+  - constructor/mode-switch requests are rejected
+
+### 3b) Syscall / kernel-interrupt policy
+
+For hardening, guest syscall-style execution is blocked:
+
+- `OP_SYSCALL` always returns permission denied
+- kernel mode transitions are denied
+- no guest path is allowed to trigger direct kernel-surface execution in this runtime build
 
 ### 4) Effective secure startup profile
 
@@ -277,9 +288,10 @@ Current security model:
    - GPU disabled
    - env/time/pid operations blocked
    - raw bytecode loading blocked (magic required)
-3. **Kernel mode guard**: kernel mode requires privileged user context on Unix-like hosts.
+3. **Kernel mode blocked**: kernel mode is disabled by runtime security policy.
 4. **Creation auth gate**: VM creation requires `auth_key` that matches `MARMOTVM_AUTH_KEY`.
-5. **ECC startup flag**: set `MARMOTVM_ECC=1` (or `true`/`on`) before startup to enable ECC flag on new VMs.
+5. **ECC startup mode**: set `MARMOTVM_ECC=1` (or `true`/`on`) and provide `MARMOTVM_ECC_KEY` for keyed integrity checks.
+6. **Brokered network policy**: when `MARMOTVM_NET_BROKER=1`, outbound connects are restricted by `MARMOTVM_NET_ALLOW`.
 
 Important: this is a hardened interpreter policy, not full OS-level process/container isolation.
 
@@ -287,7 +299,16 @@ Important: this is a hardened interpreter policy, not full OS-level process/cont
 
 ```bash
 export MARMOTVM_AUTH_KEY="change-me"
-export MARMOTVM_ECC=1   # optional: enables ECC flag on VM startup
+```
+
+### Optional hardening environment variables
+
+```bash
+export MARMOTVM_ECC=1
+export MARMOTVM_ECC_KEY="replace-with-strong-secret"
+export MARMOTVM_NET_BROKER=1
+export MARMOTVM_NET_ALLOW="api.example.com:443"
+export MARMOTVM_MAX_MEMORY_MB=64
 ```
 
 ### ECC packet behavior
@@ -295,9 +316,12 @@ export MARMOTVM_ECC=1   # optional: enables ECC flag on VM startup
 When ECC is enabled, `vm.load(packet)` enforces packet integrity:
 
 - packet must include a valid MicroVM header (magic required)
-- header checksum field (bytes `44..47`, big-endian) must equal FNV-1a32 over payload bytes after the header
+- packet must append a 16-byte authentication tag at the end:
+  - first 16 bytes of `HMAC-SHA256(payload, key)` using `MARMOTVM_ECC_KEY`
 - VM builds an internal ECC image (1 parity byte per 32 payload bytes)
-- checksum mismatch or malformed packet causes load rejection
+- if ECC is enabled and `MARMOTVM_ECC_KEY` is missing, packet load is denied
+- repeated tags are rejected per VM instance (basic replay window)
+- tag mismatch or malformed packet causes load rejection
 
 Inspection helpers:
 
@@ -316,6 +340,11 @@ Environment handling is now VM-local for isolation:
 - `OP_ENV_SET` writes to that VM cache (not host `setenv`)
 - when VM is destroyed, the cache is freed
 - next startup gets a fresh snapshot
+
+### Instance isolation and threading
+
+- broker/ECC/memory policy is stored per VM instance (`microvm_t`)
+- each VM has its own lock on Linux/macOS for thread-safe runtime/state transitions
 
 ## License
 

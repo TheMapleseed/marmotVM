@@ -121,16 +121,19 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     static char *kwlist[] = {"mode", "network", "gpu", "auth_key", "memory_mb", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|ssszk", kwlist, 
                                      &mode_str, &network_str, &gpu_str, &auth_key, &memory_mb)) {
+        Py_DECREF((PyObject *)self);
         return NULL;
     }
 
     const char *expected_auth = getenv("MARMOTVM_AUTH_KEY");
     if (!expected_auth || expected_auth[0] == '\0') {
         PyErr_SetString(PyExc_RuntimeError, "MARMOTVM_AUTH_KEY is required in environment");
+        Py_DECREF((PyObject *)self);
         return NULL;
     }
     if (!auth_key) {
         PyErr_SetString(PyExc_PermissionError, "auth_key is required");
+        Py_DECREF((PyObject *)self);
         return NULL;
     }
 
@@ -147,6 +150,7 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     }
     if (diff != 0u) {
         PyErr_SetString(PyExc_PermissionError, "Invalid auth_key");
+        Py_DECREF((PyObject *)self);
         return NULL;
     }
     
@@ -154,6 +158,12 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     microvm_mode_t mode = MICROVM_MODE_USER;
     if (strcmp(mode_str, "kernel") == 0) mode = MICROVM_MODE_KERNEL;
     else if (strcmp(mode_str, "sandbox") == 0) mode = MICROVM_MODE_SANDBOX;
+
+    if (mode == MICROVM_MODE_KERNEL) {
+        PyErr_SetString(PyExc_PermissionError, "kernel mode is disabled by runtime security policy");
+        Py_DECREF((PyObject *)self);
+        return NULL;
+    }
     
     /* Convert network string to enum */
     microvm_network_mode_t network = MICROVM_NET_ALL;
@@ -222,6 +232,7 @@ static PyObject *py_microvm_create(PyTypeObject *type, PyObject *args, PyObject 
     self->vm = microvm_create(&config);
     if (!self->vm) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to create VM (permission or config denied)");
+        Py_DECREF((PyObject *)self);
         return NULL;
     }
     
@@ -324,8 +335,12 @@ static PyObject *py_microvm_set_mode(PyObject *self, PyObject *args) {
     microvm_mode_t mode = MICROVM_MODE_USER;
     if (strcmp(mode_str, "kernel") == 0) mode = MICROVM_MODE_KERNEL;
     else if (strcmp(mode_str, "sandbox") == 0) mode = MICROVM_MODE_SANDBOX;
-    
-    microvm_set_mode(vm_obj->vm, mode);
+
+    microvm_error_t err = microvm_set_mode(vm_obj->vm, mode);
+    if (err != MICROVM_SUCCESS) {
+        PyErr_SetString(PyExc_PermissionError, "requested mode denied by runtime security policy");
+        return NULL;
+    }
     Py_RETURN_NONE;
 }
 

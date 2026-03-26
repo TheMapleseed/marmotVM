@@ -30,8 +30,10 @@
     #include <winsock2.h>
 #elif defined(__APPLE__)
     #define MICROVM_PLATFORM_MACOS
+    #include <pthread.h>
 #elif defined(__linux__)
     #define MICROVM_PLATFORM_LINUX
+    #include <pthread.h>
 #endif
 
 /* Compiler detection */
@@ -56,6 +58,8 @@
 #define MICROVM_MAX_THREADS 64
 #define MICROVM_MAX_CALL_DEPTH 1024
 #define MICROVM_MAX_BROKER_SOCKETS 64
+#define MICROVM_MAX_NET_RULES 64
+#define MICROVM_MAX_ECC_REPLAY_TAGS 128
 
 /* Execution modes */
 typedef enum microvm_mode {
@@ -286,6 +290,10 @@ typedef struct microvm {
     int socket_fd;
     int broker_sockets[MICROVM_MAX_BROKER_SOCKETS];
     bool broker_slot_used[MICROVM_MAX_BROKER_SOCKETS];
+    bool net_broker_enabled;
+    char net_allow_raw[1024];
+    microvm_net_rule_t net_rules[MICROVM_MAX_NET_RULES];
+    size_t net_rule_count;
     
     /* GPU state (if enabled) */
     void *gpu_context;
@@ -306,6 +314,14 @@ typedef struct microvm {
     uint8_t *ecc_image;
     size_t ecc_image_size;
     uint32_t ecc_packet_checksum;
+    bool ecc_keyed_enabled;
+    char ecc_key[256];
+    uint8_t ecc_seen_tags[MICROVM_MAX_ECC_REPLAY_TAGS][16];
+    size_t ecc_seen_count;
+    size_t memory_cap_bytes;
+#if defined(MICROVM_PLATFORM_LINUX) || defined(MICROVM_PLATFORM_MACOS)
+    pthread_mutex_t lock;
+#endif
 } microvm_t;
 
 /* Configuration structure */
@@ -316,6 +332,10 @@ typedef struct microvm_config {
     bool allow_env_ops;
     bool allow_time_ops;
     bool allow_raw_bytecode;
+    bool net_broker_enabled;
+    const char *net_allow_raw;
+    const char *ecc_key;
+    size_t memory_cap_bytes;
     size_t memory_size;
     size_t stack_size;
     size_t max_bytecodes;
@@ -347,6 +367,11 @@ typedef struct microvm_sockaddr {
     char port[2];
     char address[14];     /* IPv4 or IPv6 */
 } microvm_sockaddr_t;
+
+typedef struct microvm_net_rule {
+    char host[256];
+    uint16_t port;
+} microvm_net_rule_t;
 
 /* GPU kernel definition */
 typedef struct microvm_gpu_kernel {

@@ -211,6 +211,44 @@ TEST(config) {
     microvm_destroy(vm);
 }
 
+/* Sandbox cannot be reopened once set */
+TEST(sandbox_lock) {
+    microvm_t *vm = microvm_create(NULL);
+    ASSERT(vm != NULL, "VM should be created");
+    ASSERT(microvm_set_mode(vm, MICROVM_MODE_SANDBOX) == MICROVM_SUCCESS, "Sandbox mode should be set");
+    ASSERT(microvm_set_network_mode(vm, MICROVM_NET_ALL) == MICROVM_ERR_PERMISSION,
+           "Sandbox should deny enabling network");
+    ASSERT(microvm_set_gpu_mode(vm, MICROVM_GPU_ALL) == MICROVM_ERR_PERMISSION,
+           "Sandbox should deny enabling GPU");
+    microvm_destroy(vm);
+}
+
+/* SYSCALL opcode must always be denied */
+TEST(syscall_blocked) {
+    microvm_t *vm = microvm_create(NULL);
+    ASSERT(vm != NULL, "VM should be created");
+
+    uint8_t bytecode[] = {
+        OP_SYSCALL,
+        OP_HALT, 0
+    };
+    ASSERT(microvm_load(vm, bytecode, sizeof(bytecode)) == MICROVM_SUCCESS, "Bytecode should load");
+    ASSERT(microvm_run(vm) == MICROVM_ERR_PERMISSION, "SYSCALL should be blocked");
+    microvm_destroy(vm);
+}
+
+/* Sandbox should reject raw non-magic packets when loading bytecode */
+TEST(sandbox_raw_blocked) {
+    microvm_t *vm = microvm_create(NULL);
+    ASSERT(vm != NULL, "VM should be created");
+    ASSERT(microvm_set_mode(vm, MICROVM_MODE_SANDBOX) == MICROVM_SUCCESS, "Sandbox mode should be set");
+
+    uint8_t bytecode[] = { OP_HALT, 0 };
+    ASSERT(microvm_load(vm, bytecode, sizeof(bytecode)) == MICROVM_ERR_INVALID_BYTECODE,
+           "Sandbox should reject non-magic raw bytecode");
+    microvm_destroy(vm);
+}
+
 int main(void) {
     printf("=== MicroVM Test Suite ===\n\n");
     
@@ -226,6 +264,9 @@ int main(void) {
     RUN_TEST(env_get);
     RUN_TEST(vm_state);
     RUN_TEST(config);
+    RUN_TEST(sandbox_lock);
+    RUN_TEST(syscall_blocked);
+    RUN_TEST(sandbox_raw_blocked);
     
     printf("\n=== Results ===\n");
     printf("Passed: %d\n", tests_passed);
